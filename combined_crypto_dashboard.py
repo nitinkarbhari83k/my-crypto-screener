@@ -1,4 +1,6 @@
-import streamlit as st
+from pathlib import Path
+
+script = r'''import streamlit as st
 import ccxt
 import pandas as pd
 from ta.trend import EMAIndicator, MACD, ADXIndicator
@@ -7,208 +9,241 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import plotly.graph_objects as go
 
-# ================================
-# Streamlit Setup
-# ================================
-st.set_page_config(page_title="Combined Crypto Screener & TA", layout="wide")
-st.title("📊 Combined Bullish Screener + Technical Dashboard")
+# ============================================================
+# Combined Crypto Screener + Technical Dashboard
+# Exchange: KuCoin spot public market data (no trading/orders)
+# Indicators: EMA 9/20/200, RSI 14, MACD, ADX
+# ============================================================
 
-# ================================
-# Timeframe Selection
-# ================================
-timeframe = st.selectbox("Select timeframe", ["15m", "30m", "1h", "4h", "1d"], index=4)
-limit = 200
+st.set_page_config(page_title="Crypto Screener + Technical Dashboard", layout="wide")
+st.title("📊 Crypto Screener + Technical Dashboard")
+st.caption("Public market data only. This app does not place trades. Signals are for testing, not financial advice.")
 
-# =============================
-# Exchange Setup
-# =============================
-exchange = ccxt.kucoin({
-    'enableRateLimit': True,
-    'headers': {
-        'User-Agent': 'Mozilla/5.0 (compatible; StreamlitBot/1.0)'
-    }
-})
+TIMEFRAMES = ["15m", "30m", "1h", "4h", "1d"]
+timeframe = st.selectbox("Select timeframe", TIMEFRAMES, index=4)
+limit = 250  # enough candles for EMA 200
 
-# ================================
-# Utility Functions
-# ================================
-@st.cache_data(ttl=300)
+# ----------------------------
+# Exchange and market list
+# ----------------------------
+@st.cache_resource
+def get_exchange():
+    return ccxt.kucoin({
+        "enableRateLimit": True,
+        "timeout": 20000,
+        "options": {"defaultType": "spot"},
+    })
+
+exchange = get_exchange()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_usdt_symbols():
+    ex = get_exchange()
+    markets = ex.load_markets()
+    result = []
+    for symbol, market in markets.items():
+        if (
+            market.get("spot")
+            and market.get("active", True) is not False
+            and market.get("quote") == "USDT"
+            and "/" in symbol
+        ):
+            result.append(symbol)
+    # Prefer common pairs at the top, then sort remaining symbols
+    preferred = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT", "PEPE/USDT"]
+    result = sorted(set(result))
+    ordered = [s for s in preferred if s in result]
+    ordered += [s for s in result if s not in ordered]
+    return ordered
+
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_ohlcv(symbol, timeframe, limit):
-    return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    ex = get_exchange()
+    rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    if not rows:
+        raise ValueError(f"No candle data returned for {symbol}")
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert("Asia/Kolkata")
+    return df
 
-def get_support_resistance(df, lookback=20):
-    recent = df[-lookback:]
-    return round(recent['low'].min(), 4), round(recent['high'].max(), 4)
+def add_indicators(df):
+    df = df.copy()
+    df["ema9"] = EMAIndicator(close=df["close"], window=9).ema_indicator()
+    df["ema20"] = EMAIndicator(close=df["close"], window=20).ema_indicator()
+    df["ema50"] = EMAIndicator(close=df["close"], window=50).ema_indicator()
+    df["ema200"] = EMAIndicator(close=df["close"], window=200).ema_indicator()
+    macd = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
+    df["macd"] = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    df["macd_hist"] = macd.macd_diff()
+    df["rsi14"] = RSIIndicator(close=df["close"], window=14).rsi()
+    df["adx14"] = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx()
+    return df
 
 def format_price(value):
-    if value >= 1:
-        return f"{value:.4f}"
-    elif value >= 0.01:
-        return f"{value:.6f}"
-    else:
-        return f"{value:.8f}"
+    try:
+        value = float(value)
+        if value >= 1000:
+            return f"{value:,.2f}"
+        if value >= 1:
+            return f"{value:.4f}"
+        if value >= 0.01:
+            return f"{value:.6f}"
+        return f"{value:.10f}"
+    except (TypeError, ValueError):
+        return "N/A"
 
-
-def plot_price_chart(df, symbol):
+def price_chart(df, symbol, timeframe):
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
-        x=df['timestamp'], open=df['open'], high=df['high'],
-        low=df['low'], close=df['close'], name='Price',
-        increasing_line_color='green', decreasing_line_color='red'
+        x=df["timestamp"], open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"], name="Price"
     ))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ema50'], line=dict(color='blue'), name='EMA 50'))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ema200'], line=dict(color='orange'), name='EMA 200'))
+    for col, name in [
+        ("ema9", "EMA 9"), ("ema20", "EMA 20"), ("ema50", "EMA 50"), ("ema200", "EMA 200")
+    ]:
+        fig.add_trace(go.Scatter(x=df["timestamp"], y=df[col], mode="lines", name=name))
     fig.update_layout(
-        title=f"{symbol} Price Chart ({timeframe})",
-        template='plotly_dark',
-        height=600,
-        xaxis_rangeslider_visible=False
+        title=f"{symbol} — {timeframe}",
+        template="plotly_dark",
+        height=620,
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h")
     )
     return fig
 
-# ================================
-# Symbols List
-# ================================
-symbols = [
-    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "USDC/USDT",
-    "XRP/USDT", "DOGE/USDT", "TRX/USDT", "TON/USDT", "ADA/USDT",
-    "AVAX/USDT", "SHIB/USDT", "LINK/USDT", "BCH/USDT", "DOT/USDT",
-    "NEAR/USDT", "SUI/USDT", "LEO/USDT", "DAI/USDT", "APT/USDT",
-    "LTC/USDT", "UNI/USDT", "TAO/USDT", "PEPE/USDT", "ICP/USDT",
-    "FET/USDT", "KAS/USDT", "FDUSD/USDT", "XMR/USDT", "RENDER/USDT",
-    "ETC/USDT", "POL/USDT", "XLM/USDT", "STX/USDT", "WIF/USDT",
-    "IMX/USDT", "OKB/USDT", "AAVE/USDT", "FIL/USDT", "OP/USDT",
-    "INJ/USDT", "HBAR/USDT", "FTM/USDT", "MNT/USDT", "CRO/USDT",
-    "ARB/USDT", "VET/USDT", "SEI/USDT", "ATOM/USDT", "RUNE/USDT",
-    "GRT/USDT", "BONK/USDT", "BGB/USDT", "FLOKI/USDT", "TIA/USDT",
-    "THETA/USDT", "WLD/USDT", "OM/USDT", "POPCAT/USDT", "AR/USDT",
-    "PYTH/USDT", "MKR/USDT", "ENA/USDT", "JUP/USDT", "BRETT/USDT",
-    "HNT/USDT", "ALGO/USDT", "ONDO/USDT", "LDO/USDT", "KCS/USDT",
-    "MATIC/USDT", "JASMY/USDT", "BSV/USDT", "CORE/USDT", "AERO/USDT",
-    "BTT/USDT", "NOT/USDT", "FLOW/USDT", "GT/USDT", "W/USDT",
-    "STRK/USDT", "NEIRO/USDT", "BEAM/USDT", "QNT/USDT", "GALA/USDT",
-    "ORDI/USDT", "CFX/USDT", "FLR/USDT", "USDD/USDT", "EGLD/USDT",
-    "NEO/USDT", "AXS/USDT", "EOS/USDT", "MOG/USDT", "XEC/USDT",
-    "CHZ/USDT", "MEW/USDT", "XTZ/USDT", "CKB/USDT"
-]
-stablecoins = ["USDC/USDT", "DAI/USDT", "USDD/USDT", "FDUSD/USDT", "TUSD/USDT", "BUSD/USDT"]
-symbols = [s for s in symbols if s not in stablecoins]
+# ----------------------------
+# Load supported symbols
+# ----------------------------
+try:
+    with st.spinner("Loading KuCoin spot markets..."):
+        symbols = load_usdt_symbols()
+except Exception as exc:
+    st.error(f"Could not load KuCoin market list: {exc}")
+    st.info("Refresh the app and try again. If this persists, check the app logs or exchange availability.")
+    st.stop()
 
-# ================================
-# Bullish Screener
-# ================================
-st.subheader("📈 Bullish Coin Screener")
-bullish_coins = []
-progress = st.progress(0)
+if not symbols:
+    st.error("KuCoin did not return any active USDT spot pairs.")
+    st.stop()
 
-for i, symbol in enumerate(symbols):
-    try:
-        ohlcv = fetch_ohlcv(symbol, timeframe, limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['ema50'] = EMAIndicator(df['close'], window=50).ema_indicator()
-        df['ema200'] = EMAIndicator(df['close'], window=200).ema_indicator()
-        macd = MACD(df['close'])
-        df['macd'] = macd.macd()
-        df['macd_signal'] = macd.macd_signal()
-        adx = ADXIndicator(df['high'], df['low'], df['close'])
-        df['adx'] = adx.adx()
-        df['rsi'] = RSIIndicator(df['close']).rsi()
+st.success(f"Loaded {len(symbols)} active KuCoin USDT spot pairs.")
 
-        latest = df.iloc[-1]
-        previous = df.iloc[-2]
+# User can select ANY listed market; selection is not limited to bullish coins
+preferred_default = "BTC/USDT" if "BTC/USDT" in symbols else symbols[0]
+selected_symbol = st.selectbox(
+    "Choose any coin to analyze:",
+    options=symbols,
+    index=symbols.index(preferred_default),
+    key="coin_selector"
+)
 
-        if (
-            latest['ema50'] > latest['ema200'] and
-            latest['macd'] > latest['macd_signal'] and
-            latest['adx'] > 25 and
-            50 < latest['rsi'] < 70
-        ):
-            change_pct = ((latest['close'] - previous['close']) / previous['close']) * 100
-            support, resistance = get_support_resistance(df)
-            bullish_coins.append({
-                "symbol": symbol,
-                "price": latest['close'],
-                "change": change_pct,
-                "adx": latest['adx'],
-                "rsi": latest['rsi'],
-                "support": support,
-                "resistance": resistance
-            })
-    except Exception:
-        # Silently ignore errors to continue processing
-        pass
-    progress.progress((i + 1) / len(symbols))
+# ----------------------------
+# Scan selected coin
+# ----------------------------
+try:
+    with st.spinner(f"Fetching {selected_symbol} candles..."):
+        raw_df = fetch_ohlcv(selected_symbol, timeframe, limit)
+        df = add_indicators(raw_df)
+except Exception as exc:
+    st.error(f"Could not load candles for {selected_symbol}: {exc}")
+    st.stop()
 
-# ================================
-# Display Bullish Coins
-# ================================
-if bullish_coins:
-    bullish_coins = sorted(bullish_coins, key=lambda x: x["change"], reverse=True)
-    selected_symbol = st.selectbox(
-        "Choose a coin to analyze in detail:",
-        [coin["symbol"] for coin in bullish_coins]
-    )
-    for coin in bullish_coins:
-        if coin["symbol"] == selected_symbol:
-            change_symbol = "🟢" if coin["change"] > 0 else "🔴"
-            change_arrow = "↑" if coin["change"] > 0 else "↓"
-            change_pct = abs(coin["change"])
-            st.markdown(
-                f"✔️ **{coin['symbol']}** • Price: `${format_price(coin['price'])}` • `{change_symbol} Change: {change_pct:.2f}% {change_arrow}` • ADX: `{coin['adx']:.1f}` • RSI: `{coin['rsi']:.1f}`  \n"
-                f" 📌 Support: `${format_price(coin['support'])}` • Resistance: `${format_price(coin['resistance'])}`"
-            )
+if len(df) < 200:
+    st.warning(f"Only {len(df)} candles are available. EMA 200 may be incomplete or unavailable for this pair/timeframe.")
+
+latest = df.iloc[-1]
+previous = df.iloc[-2] if len(df) >= 2 else latest
+valid = pd.notna(latest["ema200"]) and pd.notna(latest["rsi14"]) and pd.notna(latest["macd_signal"])
+
+st.subheader(f"📈 Technical Dashboard: {selected_symbol}")
+try:
+    updated = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %I:%M:%S %p IST")
+except Exception:
+    updated = datetime.now().strftime("%Y-%m-%d %I:%M:%S")
+st.caption(f"Updated: {updated} • Data source: KuCoin spot public API")
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Current Price (USDT)", format_price(latest["close"]))
+c2.metric("EMA 9", format_price(latest["ema9"]))
+c3.metric("EMA 20", format_price(latest["ema20"]))
+c4.metric("EMA 200", format_price(latest["ema200"]))
+
+c5, c6, c7 = st.columns(3)
+c5.metric("RSI (14)", f'{latest["rsi14"]:.2f}' if pd.notna(latest["rsi14"]) else "N/A")
+c6.metric("MACD", format_price(latest["macd"]))
+c7.metric("MACD Signal", format_price(latest["macd_signal"]))
+
+macd_bullish = pd.notna(latest["macd"]) and pd.notna(latest["macd_signal"]) and latest["macd"] > latest["macd_signal"]
+ema_bullish = pd.notna(latest["ema9"]) and pd.notna(latest["ema20"]) and pd.notna(latest["ema200"]) and latest["ema9"] > latest["ema20"] > latest["ema200"]
+rsi_value = latest["rsi14"]
+adx_value = latest["adx14"]
+
+st.markdown("### Signal summary")
+if not valid:
+    st.warning("Not enough historical candles to calculate all indicators reliably.")
+elif ema_bullish and macd_bullish and pd.notna(rsi_value) and 50 < rsi_value < 70:
+    st.success("Bullish setup: EMA 9 > EMA 20 > EMA 200, MACD > Signal, and RSI is between 50 and 70. This is an indicator condition, not a guaranteed buy signal.")
 else:
-    st.info("No bullish setups found.")
-    selected_symbol = None
+    st.info("Full bullish conditions are not met right now. Check the individual indicators; this does not necessarily mean the coin will fall.")
 
-# ================================
-# Deep Technical Analysis Section
-# ================================
-if selected_symbol:
-    ohlcv = fetch_ohlcv(selected_symbol, timeframe, limit)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df['ema50'] = EMAIndicator(df['close'], window=50).ema_indicator()
-    df['ema200'] = EMAIndicator(df['close'], window=200).ema_indicator()
-    macd = MACD(df['close'])
-    df['macd'] = macd.macd()
-    df['macd_signal'] = macd.macd_signal()
-    adx = ADXIndicator(df['high'], df['low'], df['close'])
-    df['adx'] = adx.adx()
+if pd.notna(adx_value):
+    st.write(f"ADX (14): **{adx_value:.2f}** — {'stronger trend' if adx_value > 25 else 'weak or developing trend'}")
+st.write(f"MACD histogram: **{format_price(latest['macd_hist'])}**")
 
-    latest = df.iloc[-1]
-    swing_low = df['low'].min()
-    swing_high = df['high'].max()
-    fib1 = swing_high + (swing_high - swing_low) * 0.618
-    fib2 = swing_high + (swing_high - swing_low) * 1.0
+# ----------------------------
+# Price chart and recent data
+# ----------------------------
+st.plotly_chart(price_chart(df, selected_symbol, timeframe), use_container_width=True)
 
-    st.subheader(f"📊 Technical Dashboard: {selected_symbol}")
-    time_now = datetime.now(ZoneInfo("Asia/Phnom_Penh")).strftime("%Y-%m-%d %I:%M %p")
-    st.caption(f"🕒 Updated at: {time_now}")
+with st.expander("Show recent candles and indicators"):
+    cols = ["timestamp", "open", "high", "low", "close", "volume", "ema9", "ema20", "ema200", "rsi14", "macd", "macd_signal", "adx14"]
+    st.dataframe(df[cols].tail(30).sort_values("timestamp", ascending=False), use_container_width=True)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Current Price", f"${format_price(latest['close'])}")
-    col2.metric("EMA50", f"${format_price(latest['ema50'])}")
-    col3.metric("EMA200", f"${format_price(latest['ema200'])}")
-
-    st.markdown(
-        f"**Indicators:**  \n"
-        f"- MACD: `{format_price(latest['macd'])}` | Signal: `{format_price(latest['macd_signal'])}`  \n"
-        f"- ADX: `{format_price(latest['adx'])}` → *{'Strong trend' if latest['adx'] > 25 else 'Weak trend'}*"
-    )
-
-    if latest['ema50'] > latest['ema200'] and latest['macd'] > latest['macd_signal'] and latest['adx'] > 25:
-        st.success(
-            "✅ **STRONG BUY SIGNAL** based on:\n"
-            "- EMA crossover (EMA50 > EMA200)\n"
-            "- MACD bullish confirmation (MACD > Signal)\n"
-            "- ADX > 25 (strong trend)"
-        )
-        st.markdown(
-            f"🎯 **Target 1 (Fib 0.618):** `${format_price(fib1)}`  \n"
-            f"🎯 **Target 2 (Fib 1.000):** `${format_price(fib2)}`"
-        )
-    else:
-        st.warning("🚫 No strong buy signal yet. Wait for further confirmation.")
-
-    st.plotly_chart(plot_price_chart(df, selected_symbol), use_container_width=True)
+# ----------------------------
+# Optional bullish scan across all loaded markets
+# ----------------------------
+with st.expander("Run bullish scan across all listed USDT pairs"):
+    scan_limit = st.slider("Candles per coin (scan)", min_value=210, max_value=250, value=210, step=10)
+    max_scan = st.slider("Maximum number of coins to scan", min_value=5, max_value=min(100, len(symbols)), value=min(20, len(symbols)), step=5)
+    if st.button("Scan for bullish setups"):
+        matches = []
+        progress = st.progress(0)
+        status = st.empty()
+        scan_symbols = symbols[:max_scan]
+        for i, sym in enumerate(scan_symbols):
+            try:
+                scan_df = add_indicators(fetch_ohlcv(sym, timeframe, scan_limit))
+                row = scan_df.iloc[-1]
+                if (
+                    pd.notna(row["ema200"])
+                    and row["ema9"] > row["ema20"] > row["ema200"]
+                    and row["macd"] > row["macd_signal"]
+                    and 50 < row["rsi14"] < 70
+                ):
+                    matches.append({
+                        "Coin": sym,
+                        "Price (USDT)": format_price(row["close"]),
+                        "EMA 9": format_price(row["ema9"]),
+                        "EMA 20": format_price(row["ema20"]),
+                        "EMA 200": format_price(row["ema200"]),
+                        "RSI 14": round(float(row["rsi14"]), 2),
+                        "MACD": format_price(row["macd"]),
+                        "MACD Signal": format_price(row["macd_signal"]),
+                        "ADX 14": round(float(row["adx14"]), 2),
+                    })
+            except Exception:
+                pass
+            progress.progress((i + 1) / len(scan_symbols))
+            status.write(f"Scanned {i + 1}/{len(scan_symbols)}: {sym}")
+        progress.empty()
+        status.empty()
+        if matches:
+            st.success(f"Found {len(matches)} bullish setup(s).")
+            st.dataframe(pd.DataFrame(matches), use_container_width=True)
+        else:
+            st.info("No bullish setups found in the selected scan subset.")
+'''
+path = "/mnt/data/crypto_screener_dashboard_fixed.py"
+Path(path).write_text(script, encoding="utf-8")
+print(path, len(script.splitlines()))
